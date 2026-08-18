@@ -1769,6 +1769,15 @@ function buildCardModule(prefix, cfg) {
       cfg.cards.forEach(c => { d[c.key] = ((cfg.seed && cfg.seed[c.key]) || []).slice(); });
       store.set(prefix + '_notes', d);
     }
+    // 把本模块的错题照片读写挂到全局,供 onNativePhoto 跨闭包调用(修"只有资料分析能存")
+    window.__cardPhoto = window.__cardPhoto || {};
+    cfg.cards.forEach(c => {
+      window.__cardPhoto[c.key] = {
+        get: function() { return getPhotoData(c.key); },
+        save: function(d) { savePhotoData(c.key, d); },
+        render: function() { render(); }
+      };
+    });
   }
   function getNotes(k) { return (store.get(prefix + '_notes', {})[k] || []); }
   function saveNotes(k, arr) { const a = store.get(prefix + '_notes', {}); a[k] = arr; store.set(prefix + '_notes', a); }
@@ -2258,7 +2267,8 @@ function _fallbackFileInput() {
   const inp = document.createElement('input');
   inp.type = 'file';
   inp.accept = 'image/*';
-  // 不加 capture,让系统决定:有相机就弹"相机/图库",没相机就图库,绝不会闪退
+  // 优先拉起相机(部分机型会忽略 capture 退化为相册,但比没有强)
+  try { inp.setAttribute('capture', 'environment'); } catch (e) {}
   inp.style.position = 'fixed';
   inp.style.left = '-9999px';
   inp.style.top = '0';
@@ -2298,10 +2308,12 @@ function onNativePhoto(dataUrl) {
       renderShishi();
     } else {
       const k = _pendingPhoto.key;
-      const pd = getPhotoData(k);
+      const st = (window.__cardPhoto && window.__cardPhoto[k]) || null;
+      if (!st) { _pendingPhoto = null; _photoRender = null; alert('该模块暂不支持拍照,请重试'); return; }
+      const pd = st.get();
       pd.photos.push({ id: 'p' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), data: edited, group: pd.active });
-      savePhotoData(k, pd);
-      if (_photoRender) _photoRender();
+      st.save(pd);
+      st.render();
     }
     _pendingPhoto = null; _photoRender = null;
   });

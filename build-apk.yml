@@ -1,0 +1,540 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: ${{ github.workspace }}/android-sdk
+      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2'
+
+      - name: Install Android SDK
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y wget unzip
+          mkdir -p $ANDROID_HOME/cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q commandlinetools-linux-*.zip -d $ANDROID_HOME/cmdline-tools
+          mv $ANDROID_HOME/cmdline-tools/cmdline-tools $ANDROID_HOME/cmdline-tools/latest
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Generate Android project files
+        run: |
+          set -e
+          mkdir -p android/app/src/main/assets
+          mkdir -p android/app/src/main/java/com/beikao/app
+          mkdir -p android/app/src/main/res/values
+          mkdir -p android/app/src/main/res/drawable
+          mkdir -p android/app/src/main/res/xml
+
+          cat > android/settings.gradle << 'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'BeikaoApp'
+          include ':app'
+          EOF
+
+          cat > android/build.gradle << 'EOF'
+          buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.2.0'
+              }
+          }
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          EOF
+
+          cat > android/app/build.gradle << 'EOF'
+          apply plugin: 'com.android.application'
+
+          android {
+              namespace 'com.beikao.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.beikao.app'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+                  debug {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.core:core:1.12.0'
+          }
+          EOF
+
+          cat > android/gradle.properties << 'EOF'
+          android.useAndroidX=true
+          android.enableJetifier=true
+          org.gradle.jvmargs=-Xmx2048m
+          EOF
+
+          cat > android/app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="32" />
+
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+              <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="备考工作台"
+                  android:theme="@style/Theme.Beikao"
+                  android:usesCleartextTraffic="true"
+                  tools:targetApi="34">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="com.beikao.app.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+              </application>
+          </manifest>
+          EOF
+
+          cat > android/app/src/main/java/com/beikao/app/MainActivity.java << 'EOF'
+          package com.beikao.app;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.graphics.Bitmap;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.provider.MediaStore;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.JsPromptResult;
+          import android.webkit.JsResult;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.EditText;
+          import androidx.core.content.FileProvider;
+          import android.os.Environment;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.util.Base64;
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.OutputStream;
+
+          public class MainActivity extends Activity {
+
+              private WebView webView;
+              private ValueCallback<Uri[]> filePathCallback;
+              private Uri cameraOutputUri;
+              private AppBridge bridge;
+              private static final int FILE_CHOOSER_CODE = 1001;
+              private boolean bridgePhoto = false;
+              private static final int BRIDGE_CODE = 9001;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  webView = new WebView(this);
+                  WebSettings ws = webView.getSettings();
+                  ws.setJavaScriptEnabled(true);
+                  ws.setDomStorageEnabled(true);
+                  ws.setAllowFileAccess(true);
+                  ws.setAllowContentAccess(true);
+                  ws.setAllowUniversalAccessFromFileURLs(true);
+                  ws.setAllowFileAccessFromFileURLs(true);
+                  ws.setMediaPlaybackRequiresUserGesture(false);
+                  ws.setCacheMode(WebSettings.LOAD_DEFAULT);
+
+                  bridge = new AppBridge(this);
+                  webView.addJavascriptInterface(bridge, "AppBridge");
+
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onJsAlert(WebView view, String url, String message, JsResult result) {
+                          new AlertDialog.Builder(MainActivity.this)
+                                  .setMessage(message)
+                                  .setPositiveButton(android.R.string.ok, (d, w) -> result.confirm())
+                                  .setOnCancelListener(d -> result.confirm())
+                                  .show();
+                          return true;
+                      }
+
+                      @Override
+                      public boolean onJsConfirm(WebView view, String url, String message, JsResult result) {
+                          new AlertDialog.Builder(MainActivity.this)
+                                  .setMessage(message)
+                                  .setPositiveButton(android.R.string.ok, (d, w) -> result.confirm())
+                                  .setNegativeButton(android.R.string.cancel, (d, w) -> result.cancel())
+                                  .setOnCancelListener(d -> result.cancel())
+                                  .show();
+                          return true;
+                      }
+
+                      @Override
+                      public boolean onJsPrompt(WebView view, String url, String message, String defaultValue, JsPromptResult result) {
+                          final EditText input = new EditText(MainActivity.this);
+                          if (defaultValue != null) input.setText(defaultValue);
+                          new AlertDialog.Builder(MainActivity.this)
+                                  .setMessage(message)
+                                  .setView(input)
+                                  .setPositiveButton(android.R.string.ok, (d, w) -> result.confirm(input.getText().toString()))
+                                  .setNegativeButton(android.R.string.cancel, (d, w) -> result.cancel())
+                                  .setOnCancelListener(d -> result.cancel())
+                                  .show();
+                          return true;
+                      }
+
+                      @Override
+                      public boolean onShowFileChooser(WebView wv, ValueCallback<Uri[]> cb,
+                                                        WebChromeClient.FileChooserParams fp) {
+                          filePathCallback = cb;
+                          cameraOutputUri = null;
+                          try {
+                              String[] acceptTypes = fp.getAcceptTypes();
+                              boolean isImage = false;
+                              if (acceptTypes != null) {
+                                  for (String t : acceptTypes) {
+                                      if (t != null && t.startsWith("image")) { isImage = true; break; }
+                                  }
+                              }
+                              if (isImage) {
+                                  showImagePicker();
+                              } else {
+                                  startActivityForResult(fp.createIntent(), FILE_CHOOSER_CODE);
+                              }
+                          } catch (Exception e) {
+                              filePathCallback = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+
+                  webView.loadUrl("file:///android_asset/index.html");
+                  setContentView(webView);
+              }
+
+              private int photoRequestCode() {
+                  return bridgePhoto ? BRIDGE_CODE : FILE_CHOOSER_CODE;
+              }
+
+              private void showImagePicker() {
+                  AlertDialog.Builder builder = new AlertDialog.Builder(this);
+                  builder.setTitle("选择图片来源");
+                  builder.setItems(new CharSequence[]{"拍照", "从相册选择"}, (dialog, which) -> {
+                      if (which == 0) {
+                          openCamera();
+                      } else {
+                          openGallery();
+                      }
+                  });
+                  builder.setOnCancelListener(dialog -> {
+                      bridgePhoto = false;
+                      if (filePathCallback != null) {
+                          filePathCallback.onReceiveValue(null);
+                          filePathCallback = null;
+                      }
+                  });
+                  builder.show();
+              }
+
+              private void openCamera() {
+                  File picsDir = new File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "beikao");
+                  if (!picsDir.exists()) picsDir.mkdirs();
+                  File photoFile = new File(picsDir, "beikao_" + System.currentTimeMillis() + ".jpg");
+                  try {
+                      cameraOutputUri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", photoFile);
+                      Intent cameraIntent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+                      cameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, cameraOutputUri);
+                      cameraIntent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                      startActivityForResult(cameraIntent, photoRequestCode());
+                  } catch (Exception e) {
+                      // 部分机型不支持 FileProvider 作为 EXTRA_OUTPUT，退回不带输出的相机（取缩略图兜底）
+                      try {
+                          cameraOutputUri = null;
+                          startActivityForResult(new Intent(MediaStore.ACTION_IMAGE_CAPTURE), photoRequestCode());
+                      } catch (Exception e2) {
+                          openGallery();
+                      }
+                  }
+              }
+
+              private void openGallery() {
+                  Intent galleryIntent = new Intent(Intent.ACTION_PICK,
+                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+                  galleryIntent.setType("image/*");
+                  galleryIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                  try {
+                      startActivityForResult(galleryIntent, photoRequestCode());
+                  } catch (Exception e) {
+                      if (filePathCallback != null) {
+                          filePathCallback.onReceiveValue(null);
+                          filePathCallback = null;
+                      }
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode == FILE_CHOOSER_CODE) {
+                      if (filePathCallback == null) return;
+                      Uri[] results = null;
+                      if (resultCode == Activity.RESULT_OK) {
+                          if (data != null && data.getData() != null) {
+                              results = new Uri[]{ data.getData() };
+                          } else if (cameraOutputUri != null) {
+                              results = new Uri[]{ cameraOutputUri };
+                          } else if (data != null && data.getExtras() != null) {
+                              Bitmap thumb = (Bitmap) data.getExtras().get("data");
+                              if (thumb != null) {
+                                  Uri u = saveBitmapToCache(thumb);
+                                  if (u != null) results = new Uri[]{ u };
+                              }
+                          }
+                      } else {
+                          if (cameraOutputUri != null) {
+                              try { getContentResolver().delete(cameraOutputUri, null, null); } catch (Exception ignore) {}
+                          }
+                      }
+                      filePathCallback.onReceiveValue(results);
+                      filePathCallback = null;
+                      cameraOutputUri = null;
+                  } else if (requestCode == BRIDGE_CODE) {
+                      bridgePhoto = false;
+                      Bitmap bmp = null;
+                      if (resultCode == Activity.RESULT_OK) {
+                          if (data != null && data.getExtras() != null) {
+                              bmp = (Bitmap) data.getExtras().get("data");
+                          }
+                          if (bmp == null && cameraOutputUri != null) bmp = decodeUri(cameraOutputUri);
+                          if (bmp == null && data != null && data.getData() != null) bmp = decodeUri(data.getData());
+                      }
+                      if (cameraOutputUri != null) {
+                          try { getContentResolver().delete(cameraOutputUri, null, null); } catch (Exception ignore) {}
+                      }
+                      cameraOutputUri = null;
+                      deliverPhoto(bmp);
+                  }
+              }
+
+              private Uri saveBitmapToCache(Bitmap bmp) {
+                  try {
+                      File dir = new File(getCacheDir(), "photos");
+                      if (!dir.exists()) dir.mkdirs();
+                      File f = new File(dir, "beikao_" + System.currentTimeMillis() + ".jpg");
+                      try (OutputStream os = new FileOutputStream(f)) {
+                          bmp.compress(Bitmap.CompressFormat.JPEG, 90, os);
+                      }
+                      return Uri.fromFile(f);
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              private Bitmap decodeUri(Uri uri) {
+                  if (uri == null) return null;
+                  try (InputStream is = getContentResolver().openInputStream(uri)) {
+                      return BitmapFactory.decodeStream(is);
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              private void deliverPhoto(Bitmap bmp) {
+                  if (bmp == null) {
+                      webView.post(() -> webView.evaluateJavascript("javascript:alert('未能获取照片，请重试')", null));
+                      return;
+                  }
+                  try {
+                      int maxDim = 800;
+                      float scale = Math.min(1f, maxDim / (float) Math.max(bmp.getWidth(), bmp.getHeight()));
+                      Bitmap scaled = (scale < 1f)
+                              ? Bitmap.createScaledBitmap(bmp, (int) (bmp.getWidth() * scale), (int) (bmp.getHeight() * scale), true)
+                              : bmp;
+                      ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                      scaled.compress(Bitmap.CompressFormat.JPEG, 80, baos);
+                      if (scaled != bmp) scaled.recycle();
+                      String b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
+                      String js = "javascript:onNativePhoto('data:image/jpeg;base64," + b64 + "')";
+                      webView.post(() -> webView.evaluateJavascript(js, null));
+                  } catch (Exception e) {
+                      webView.post(() -> webView.evaluateJavascript("javascript:alert('照片处理失败，请重试')", null));
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (bridge != null && bridge.isPhotoViewerOpen()) {
+                      webView.evaluateJavascript("zlClosePhotoViewer()", null);
+                      return;
+                  }
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                      return;
+                  }
+                  super.onBackPressed();
+              }
+
+              public static class AppBridge {
+                  private final MainActivity activity;
+                  private boolean photoViewerOpen = false;
+
+                  AppBridge(MainActivity activity) {
+                      this.activity = activity;
+                  }
+
+                  @JavascriptInterface
+                  public void setPhotoViewerOpen(boolean open) {
+                      photoViewerOpen = open;
+                  }
+
+                  public boolean isPhotoViewerOpen() {
+                      return photoViewerOpen;
+                  }
+
+                  @JavascriptInterface
+                  public void takePhoto() {
+                      activity.runOnUiThread(() -> {
+                          activity.bridgePhoto = true;
+                          activity.showImagePicker();
+                      });
+                  }
+              }
+          }
+          EOF
+
+          cat > android/app/src/main/res/values/strings.xml << 'EOF'
+          <resources>
+              <string name="app_name">备考工作台</string>
+          </resources>
+          EOF
+
+          cat > android/app/src/main/res/values/themes.xml << 'EOF'
+          <resources>
+              <style name="Theme.Beikao" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:statusBarColor">#E0301E</item>
+                  <item name="android:navigationBarColor">#FFFFFF</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > android/app/src/main/res/xml/file_paths.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <external-files-path name="beikao_pics" path="Pictures" />
+          </paths>
+          EOF
+
+          cat > android/app/src/main/res/drawable/ic_launcher.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#E0301E"
+                  android:pathData="M0,0h108v108h-108z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M54,16 L62.82,41.87 L90.14,42.26 L68.27,58.63 L76.34,84.74 L54,69 L31.66,84.74 L39.73,58.63 L17.86,42.26 L45.18,41.87 Z" />
+          </vector>
+          EOF
+
+      - name: Copy index.html into app assets
+        run: cp index.html android/app/src/main/assets/index.html
+
+      - name: Build Debug APK
+        run: |
+          cd android
+          gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: beikao-app-apk
+          path: android/app/build/outputs/apk/debug/*.apk

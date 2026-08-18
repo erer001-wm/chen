@@ -1555,8 +1555,7 @@ function renderZlSub(key) {
       + '<select class="input photo-group-sel" title="选择当前分组（新拍照片归入此处）" onchange="zlSetGroup(this.value)">' + groupOpts + '</select>'
       + '<button class="btn" onclick="zlAddGroup()">＋ 新建分组</button>'
       + '<button class="btn btn-ghost" onclick="zlDelGroup(\'' + pd.active + '\')">🗑 删除当前分组</button>'
-      + '<button class="btn btn-primary" onclick="document.getElementById(\'zl-photo-input\').click()">📷 拍摄错题</button>'
-      + '<input type="file" id="zl-photo-input" accept="image/*" capture="environment" style="display:none" onchange="zlHandlePhoto(this)">'
+      + '<button class="btn btn-primary" onclick="takePhotoBridge({kind:\'ziliao\'})">📷 拍摄错题</button>'
       + '</div>'
       + '<div class="photo-groups">' + groupsHtml + '</div>'
       + '</div>';
@@ -1729,6 +1728,10 @@ function buildCardModule(prefix, cfg) {
     photo:    prefix + '_cPhoto',
     delPhoto: prefix + '_cDelPhoto',
     zoom:     prefix + '_cZoom',
+    addGroup: prefix + '_cAddGroup',
+    delGroup: prefix + '_cDelGroup',
+    setGroup: prefix + '_cSetGroup',
+    movePhoto:prefix + '_cMovePhoto',
   };
   let sub = null;   // null = 卡片网格，否则 = 当前卡片 key
   /* 每张卡片独立的错题照片存储键，避免多错题本互相混 */
@@ -1802,6 +1805,7 @@ function buildCardModule(prefix, cfg) {
   }
 
   function renderSub(key) {
+    window.__photoRender = render;
     const card = cfg.cards.find(c => c.key === key);
     if (!card) { sub = null; renderGrid(); return; }
 
@@ -1847,8 +1851,7 @@ function buildCardModule(prefix, cfg) {
         + '<select class="input photo-group-sel" title="选择当前分组（新拍照片归入此处）" onchange="' + FN.setGroup + '(\'' + key + '\',this.value)">' + groupOpts + '</select>'
         + '<button class="btn" onclick="' + FN.addGroup + '(\'' + key + '\')">＋ 新建分组</button>'
         + '<button class="btn btn-ghost" onclick="' + FN.delGroup + '(\'' + key + '\',\'' + pd.active + '\')">🗑 删除当前分组</button>'
-        + '<button class="btn btn-primary" onclick="document.getElementById(\'' + prefix + '-photo-input\').click()">📷 拍摄错题</button>'
-        + '<input type="file" id="' + prefix + '-photo-input" accept="image/*" capture="environment" style="display:none" onchange="' + FN.photo + '(this)">'
+        + '<button class="btn btn-primary" onclick="takePhotoBridge({kind:\'module\', key:\'' + key + '\'}, window.__photoRender)">📷 拍摄错题</button>'
         + '</div>'
         + '<div class="photo-groups">' + groupsHtml + '</div>'
         + '</div>';
@@ -2219,8 +2222,7 @@ function renderShishiWrong(page) {
     + '<div class="photo-toolbar"><select class="input photo-group-sel" title="选择当前分组（新拍照片归入此处）" onchange="shishiSetGroup(this.value)">' + groupOpts + '</select>'
     + '<button class="btn" onclick="shishiAddGroup()">＋ 新建分组</button>'
     + '<button class="btn btn-ghost" onclick="shishiDelGroup(\'' + pd.active + '\')">🗑 删除当前分组</button>'
-    + '<button class="btn btn-primary" onclick="document.getElementById(\'shishi-photo-input\').click()">📷 拍摄错题</button>'
-    + '<input type="file" id="shishi-photo-input" accept="image/*" capture="environment" style="display:none" onchange="shishiPhoto(this)"></div>'
+        + '<button class="btn btn-primary" onclick="takePhotoBridge({kind:\'shishi\'})">📷 拍摄错题</button></div>'
     + '<div class="photo-groups">' + groupsHtml + '</div></div>';
 }
 /* 事件委托：时政卡片点击进入子页（容器重建后仍有效） */
@@ -2239,6 +2241,42 @@ function escHtml(s) {
 /* ================================================================
    导航切换逻辑（记住上次停留页面，刷新不丢失）
    ================================================================ */
+/* 原生相机桥接：拍照/选图后由 AppBridge 回传 base64，统一写入错题本 */
+let _pendingPhoto = null;     // {kind:'ziliao'} | {kind:'module', key}
+let _photoRender = null;      // buildCardModule 当前 render 闭包
+function takePhotoBridge(target, renderFn) {
+  _pendingPhoto = target;
+  _photoRender = renderFn || null;
+  if (typeof AppBridge !== 'undefined' && AppBridge && AppBridge.takePhoto) {
+    AppBridge.takePhoto();
+  } else {
+    alert('相机不可用：请在 App 中打开本页');
+  }
+}
+function onNativePhoto(dataUrl) {
+  if (!_pendingPhoto || !dataUrl) { _pendingPhoto = null; _photoRender = null; return; }
+  PhotoEditor.open(dataUrl, (edited) => {
+    if (_pendingPhoto.kind === 'ziliao') {
+      const pd = zlGetPhotoData();
+      pd.photos.push({ id: 'p' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), data: edited, group: pd.active });
+      zlSavePhotoData(pd);
+      renderZiliao();
+    } else if (_pendingPhoto.kind === 'shishi') {
+      const pd = shishiPhotoData();
+      pd.photos.push({ id: 'p' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), data: edited, group: pd.active });
+      shishiSavePhoto(pd);
+      renderShishi();
+    } else {
+      const k = _pendingPhoto.key;
+      const pd = getPhotoData(k);
+      pd.photos.push({ id: 'p' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), data: edited, group: pd.active });
+      savePhotoData(k, pd);
+      if (_photoRender) _photoRender();
+    }
+    _pendingPhoto = null; _photoRender = null;
+  });
+}
+
 function switchPage(pageId) {
   document.querySelectorAll('.nav-item').forEach(el =>
     el.classList.toggle('active', el.dataset.page === pageId));

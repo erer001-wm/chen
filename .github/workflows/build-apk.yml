@@ -193,6 +193,11 @@ jobs:
           import android.widget.EditText;
           import androidx.core.content.FileProvider;
           import android.os.Environment;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.util.Base64;
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
 
           import java.io.File;
           import java.io.FileOutputStream;
@@ -205,6 +210,8 @@ jobs:
               private Uri cameraOutputUri;
               private AppBridge bridge;
               private static final int FILE_CHOOSER_CODE = 1001;
+              private boolean bridgePhoto = false;
+              private static final int BRIDGE_CODE = 9001;
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
@@ -221,10 +228,17 @@ jobs:
                   ws.setMediaPlaybackRequiresUserGesture(false);
                   ws.setCacheMode(WebSettings.LOAD_DEFAULT);
 
-                  bridge = new AppBridge();
+                  bridge = new AppBridge(this);
                   webView.addJavascriptInterface(bridge, "AppBridge");
 
-                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          super.onPageFinished(view, url);
+                          // 强制把原生桥挂到 window,确保 JS 一定能访问 AppBridge
+                          view.evaluateJavascript("window.AppBridge = AppBridge;", null);
+                      }
+                  });
                   webView.setWebChromeClient(new WebChromeClient() {
                       @Override
                       public boolean onJsAlert(WebView view, String url, String message, JsResult result) {
@@ -291,6 +305,10 @@ jobs:
                   setContentView(webView);
               }
 
+              private int photoRequestCode() {
+                  return bridgePhoto ? BRIDGE_CODE : FILE_CHOOSER_CODE;
+              }
+
               private void showImagePicker() {
                   AlertDialog.Builder builder = new AlertDialog.Builder(this);
                   builder.setTitle("选择图片来源");
@@ -302,6 +320,7 @@ jobs:
                       }
                   });
                   builder.setOnCancelListener(dialog -> {
+                      bridgePhoto = false;
                       if (filePathCallback != null) {
                           filePathCallback.onReceiveValue(null);
                           filePathCallback = null;
@@ -311,18 +330,23 @@ jobs:
               }
 
               private void openCamera() {
+                  File picsDir = new File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "beikao");
+                  if (!picsDir.exists()) picsDir.mkdirs();
+                  File photoFile = new File(picsDir, "beikao_" + System.currentTimeMillis() + ".jpg");
                   try {
-                      File picsDir = new File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "beikao");
-                      if (!picsDir.exists()) picsDir.mkdirs();
-                      File photoFile = new File(picsDir, "beikao_" + System.currentTimeMillis() + ".jpg");
                       cameraOutputUri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", photoFile);
                       Intent cameraIntent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
                       cameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, cameraOutputUri);
                       cameraIntent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-                      startActivityForResult(cameraIntent, FILE_CHOOSER_CODE);
+                      startActivityForResult(cameraIntent, photoRequestCode());
                   } catch (Exception e) {
-                      cameraOutputUri = null;
-                      openGallery();
+                      // 部分机型不支持 FileProvider 作为 EXTRA_OUTPUT，退回不带输出的相机（取缩略图兜底）
+                      try {
+                          cameraOutputUri = null;
+                          startActivityForResult(new Intent(MediaStore.ACTION_IMAGE_CAPTURE), photoRequestCode());
+                      } catch (Exception e2) {
+                          openGallery();
+                      }
                   }
               }
 
@@ -332,7 +356,7 @@ jobs:
                   galleryIntent.setType("image/*");
                   galleryIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
                   try {
-                      startActivityForResult(galleryIntent, FILE_CHOOSER_CODE);
+                      startActivityForResult(galleryIntent, photoRequestCode());
                   } catch (Exception e) {
                       if (filePathCallback != null) {
                           filePathCallback.onReceiveValue(null);
@@ -367,6 +391,21 @@ jobs:
                       filePathCallback.onReceiveValue(results);
                       filePathCallback = null;
                       cameraOutputUri = null;
+                  } else if (requestCode == BRIDGE_CODE) {
+                      bridgePhoto = false;
+                      Bitmap bmp = null;
+                      if (resultCode == Activity.RESULT_OK) {
+                          if (data != null && data.getExtras() != null) {
+                              bmp = (Bitmap) data.getExtras().get("data");
+                          }
+                          if (bmp == null && cameraOutputUri != null) bmp = decodeUri(cameraOutputUri);
+                          if (bmp == null && data != null && data.getData() != null) bmp = decodeUri(data.getData());
+                      }
+                      if (cameraOutputUri != null) {
+                          try { getContentResolver().delete(cameraOutputUri, null, null); } catch (Exception ignore) {}
+                      }
+                      cameraOutputUri = null;
+                      deliverPhoto(bmp);
                   }
               }
 
@@ -384,6 +423,37 @@ jobs:
                   }
               }
 
+              private Bitmap decodeUri(Uri uri) {
+                  if (uri == null) return null;
+                  try (InputStream is = getContentResolver().openInputStream(uri)) {
+                      return BitmapFactory.decodeStream(is);
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              private void deliverPhoto(Bitmap bmp) {
+                  if (bmp == null) {
+                      webView.post(() -> webView.evaluateJavascript("javascript:alert('未能获取照片，请重试')", null));
+                      return;
+                  }
+                  try {
+                      int maxDim = 800;
+                      float scale = Math.min(1f, maxDim / (float) Math.max(bmp.getWidth(), bmp.getHeight()));
+                      Bitmap scaled = (scale < 1f)
+                              ? Bitmap.createScaledBitmap(bmp, (int) (bmp.getWidth() * scale), (int) (bmp.getHeight() * scale), true)
+                              : bmp;
+                      ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                      scaled.compress(Bitmap.CompressFormat.JPEG, 80, baos);
+                      if (scaled != bmp) scaled.recycle();
+                      String b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
+                      String js = "javascript:onNativePhoto('data:image/jpeg;base64," + b64 + "')";
+                      webView.post(() -> webView.evaluateJavascript(js, null));
+                  } catch (Exception e) {
+                      webView.post(() -> webView.evaluateJavascript("javascript:alert('照片处理失败，请重试')", null));
+                  }
+              }
+
               @Override
               public void onBackPressed() {
                   if (bridge != null && bridge.isPhotoViewerOpen()) {
@@ -398,7 +468,12 @@ jobs:
               }
 
               public static class AppBridge {
+                  private final MainActivity activity;
                   private boolean photoViewerOpen = false;
+
+                  AppBridge(MainActivity activity) {
+                      this.activity = activity;
+                  }
 
                   @JavascriptInterface
                   public void setPhotoViewerOpen(boolean open) {
@@ -407,6 +482,14 @@ jobs:
 
                   public boolean isPhotoViewerOpen() {
                       return photoViewerOpen;
+                  }
+
+                  @JavascriptInterface
+                  public void takePhoto() {
+                      activity.runOnUiThread(() -> {
+                          activity.bridgePhoto = true;
+                          activity.showImagePicker();
+                      });
                   }
               }
           }

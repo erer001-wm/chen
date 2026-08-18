@@ -310,23 +310,8 @@ jobs:
               }
 
               private void showImagePicker() {
-                  AlertDialog.Builder builder = new AlertDialog.Builder(this);
-                  builder.setTitle("选择图片来源");
-                  builder.setItems(new CharSequence[]{"拍照", "从相册选择"}, (dialog, which) -> {
-                      if (which == 0) {
-                          openCamera();
-                      } else {
-                          openGallery();
-                      }
-                  });
-                  builder.setOnCancelListener(dialog -> {
-                      bridgePhoto = false;
-                      if (filePathCallback != null) {
-                          filePathCallback.onReceiveValue(null);
-                          filePathCallback = null;
-                      }
-                  });
-                  builder.show();
+                  // 仅支持从相册选取图片,不再提供拍照入口
+                  openGallery();
               }
 
               private void openCamera() {

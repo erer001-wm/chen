@@ -506,8 +506,7 @@ textarea.input { resize: vertical; min-height: 80px; }
 }
 .zl-photo-viewer.show { display: flex; }
 .zl-photo-viewer img {
-  max-width: 100%; max-height: 82vh; display: block;
-  border-radius: 8px; object-fit: contain;
+  display: block;
 }
 .zl-photo-close {
   position: absolute; top: 14px; right: 14px;
@@ -522,7 +521,6 @@ textarea.input { resize: vertical; min-height: 80px; }
   text-align: center; color: rgba(255,255,255,.8); font-size: 13px;
 }
 @media (max-width: 768px) {
-  .zl-photo-viewer img { max-height: 72vh; }
   .zl-photo-close { top: 10px; right: 10px; width: 40px; height: 40px; }
 }
 .zl-pv-bar {
@@ -540,13 +538,13 @@ textarea.input { resize: vertical; min-height: 80px; }
 .zl-pv-edit { background: #E0301E; color: #fff; }
 .zl-pv-zoom { color: #fff; font-size: 13px; min-width: 46px; text-align: center; font-weight: 700; }
 .zl-pv-stage {
-  position: relative; max-width: 100%; max-height: 82vh; display: flex;
-  align-items: center; justify-content: center; overflow: hidden; touch-action: none;
+  position: absolute; left: 0; right: 0; top: 52px; bottom: 38px;
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden; touch-action: none;
 }
 .zl-pv-stage img {
-  max-width: 100%; max-height: 82vh; display: block; border-radius: 8px;
-  object-fit: contain; touch-action: none; user-select: none; -webkit-user-select: none;
-  will-change: transform; transform-origin: center center;
+  display: block; border-radius: 8px; touch-action: none; user-select: none;
+  -webkit-user-select: none; will-change: width, height, transform; transform-origin: center center;
 }
 @media (max-width: 768px) {
   .zl-pv-stage, .zl-pv-stage img { max-height: 72vh; }
@@ -1669,24 +1667,38 @@ function zlZoomPhoto(pid) {
 }
 let zlPvCtx = null;
 let zlPvScale = 1, zlPvTx = 0, zlPvTy = 0;
+let zlPvFit = { w: 0, h: 0 };
 let zlPvPointers = new Map();
 let zlPvPinch = null;
 let zlPvDrag = null;
 
+function zlPvComputeFit() {
+  const img = document.getElementById('zlPhotoViewerImg');
+  const stage = document.getElementById('zlPvStage');
+  if (!img || !stage) return;
+  const nw = img.naturalWidth || img.width || 1;
+  const nh = img.naturalHeight || img.height || 1;
+  const sw = stage.clientWidth || 1, sh = stage.clientHeight || 1;
+  const s = Math.min(sw / nw, sh / nh);
+  zlPvFit.w = nw * s; zlPvFit.h = nh * s;
+}
 function zlApplyPv() {
   const img = document.getElementById('zlPhotoViewerImg');
-  if (img) img.style.transform = 'translate(' + zlPvTx + 'px,' + zlPvTy + 'px) scale(' + zlPvScale + ')';
+  if (img) {
+    img.style.width = (zlPvFit.w * zlPvScale) + 'px';
+    img.style.height = (zlPvFit.h * zlPvScale) + 'px';
+    img.style.transform = 'translate(' + zlPvTx + 'px,' + zlPvTy + 'px)';
+  }
   const z = document.getElementById('zlPvZoom');
   if (z) z.textContent = Math.round(zlPvScale * 100) + '%';
 }
 function zlPvClamp() {
   const stage = document.getElementById('zlPvStage');
-  const img = document.getElementById('zlPhotoViewerImg');
-  if (!stage || !img) return;
-  const r = img.getBoundingClientRect();
-  const sr = stage.getBoundingClientRect();
-  const maxX = Math.max(0, (r.width * zlPvScale - sr.width) / 2 + 40);
-  const maxY = Math.max(0, (r.height * zlPvScale - sr.height) / 2 + 40);
+  if (!stage) return;
+  const sw = stage.clientWidth, sh = stage.clientHeight;
+  const w = zlPvFit.w * zlPvScale, h = zlPvFit.h * zlPvScale;
+  const maxX = Math.max(0, (w - sw) / 2 + 30);
+  const maxY = Math.max(0, (h - sh) / 2 + 30);
   if (zlPvTx > maxX) zlPvTx = maxX; if (zlPvTx < -maxX) zlPvTx = -maxX;
   if (zlPvTy > maxY) zlPvTy = maxY; if (zlPvTy < -maxY) zlPvTy = -maxY;
 }
@@ -1709,15 +1721,18 @@ function zlOpenPhotoViewer(src, ctx) {
   zlPvCtx = ctx || null;
   zlPvScale = 1; zlPvTx = 0; zlPvTy = 0;
   const v = document.getElementById('zlPhotoViewer');
-  document.getElementById('zlPhotoViewerImg').src = src;
-  zlApplyPv();
+  const img = document.getElementById('zlPhotoViewerImg');
   v.classList.add('show');
+  img.onload = function () { zlPvComputeFit(); zlPvClamp(); zlApplyPv(); };
+  img.src = src;
+  if (img.complete) { zlPvComputeFit(); zlPvClamp(); zlApplyPv(); }
   if (window.AppBridge && AppBridge.setPhotoViewerOpen) AppBridge.setPhotoViewerOpen(true);
 }
 function zlClosePhotoViewer() {
   const v = document.getElementById('zlPhotoViewer');
   v.classList.remove('show');
-  document.getElementById('zlPhotoViewerImg').src = '';
+  const img = document.getElementById('zlPhotoViewerImg');
+  img.src = ''; img.onload = null;
   zlPvScale = 1; zlPvTx = 0; zlPvTy = 0;
   if (window.AppBridge && AppBridge.setPhotoViewerOpen) AppBridge.setPhotoViewerOpen(false);
 }
@@ -1727,8 +1742,11 @@ function zlEditCurrentPhoto() {
   const src = document.getElementById('zlPhotoViewerImg').src;
   PhotoEditor.open(src, function (edited) {
     zlSavePhotoDataById(zlPvCtx, edited);
-    document.getElementById('zlPhotoViewerImg').src = edited;
-    zlPvScale = 1; zlPvTx = 0; zlPvTy = 0; zlApplyPv();
+    const img = document.getElementById('zlPhotoViewerImg');
+    img.onload = function () { zlPvComputeFit(); zlPvClamp(); zlApplyPv(); };
+    img.src = edited;
+    if (img.complete) { zlPvComputeFit(); zlPvClamp(); zlApplyPv(); }
+    zlPvScale = 1; zlPvTx = 0; zlPvTy = 0;
   });
 }
 function zlSavePhotoDataById(ctx, data) {

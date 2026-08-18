@@ -525,6 +525,32 @@ textarea.input { resize: vertical; min-height: 80px; }
   .zl-photo-viewer img { max-height: 72vh; }
   .zl-photo-close { top: 10px; right: 10px; width: 40px; height: 40px; }
 }
+.zl-pv-bar {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 5;
+  display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+  background: linear-gradient(rgba(20,12,16,.88), rgba(20,12,16,0));
+}
+.zl-pv-btn {
+  height: 38px; min-width: 38px; padding: 0 10px; border: none; border-radius: 19px;
+  background: rgba(255,255,255,.92); color: #5A3A44; font-size: 15px; font-weight: 700;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 2px 8px rgba(0,0,0,.25);
+}
+.zl-pv-btn:active { background: #E0301E; color: #fff; }
+.zl-pv-edit { background: #E0301E; color: #fff; }
+.zl-pv-zoom { color: #fff; font-size: 13px; min-width: 46px; text-align: center; font-weight: 700; }
+.zl-pv-stage {
+  position: relative; max-width: 100%; max-height: 82vh; display: flex;
+  align-items: center; justify-content: center; overflow: hidden; touch-action: none;
+}
+.zl-pv-stage img {
+  max-width: 100%; max-height: 82vh; display: block; border-radius: 8px;
+  object-fit: contain; touch-action: none; user-select: none; -webkit-user-select: none;
+  will-change: transform; transform-origin: center center;
+}
+@media (max-width: 768px) {
+  .zl-pv-stage, .zl-pv-stage img { max-height: 72vh; }
+}
 .form-row label { display: block; font-size: 13px; color: var(--text-sub); margin-bottom: 6px; }
 .form-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 
@@ -735,9 +761,18 @@ textarea.input { resize: vertical; min-height: 80px; }
 </head>
 <body>
 <div class="zl-photo-viewer" id="zlPhotoViewer">
-  <button class="zl-photo-close" onclick="zlClosePhotoViewer()">✕</button>
-  <img id="zlPhotoViewerImg" alt="错题照片放大" src="">
-  <div class="zl-photo-tip">点击空白处或按返回键关闭</div>
+  <div class="zl-pv-bar">
+    <button type="button" class="zl-pv-btn" data-z="out" title="缩小">－</button>
+    <span class="zl-pv-zoom" id="zlPvZoom">100%</span>
+    <button type="button" class="zl-pv-btn" data-z="in" title="放大">＋</button>
+    <button type="button" class="zl-pv-btn" data-z="reset" title="还原大小">重置</button>
+    <button type="button" class="zl-pv-btn zl-pv-edit" id="zlPvEditBtn">✎ 标注</button>
+    <button type="button" class="zl-photo-close" onclick="zlClosePhotoViewer()" title="关闭">✕</button>
+  </div>
+  <div class="zl-pv-stage" id="zlPvStage">
+    <img id="zlPhotoViewerImg" alt="错题照片" src="">
+  </div>
+  <div class="zl-photo-tip">双指捏合 / 双击放大 · 拖动查看 · 点空白处或返回键关闭</div>
 </div>
 <div class="app">
 
@@ -1630,11 +1665,52 @@ function zlZoomPhoto(pid) {
   const pd = zlGetPhotoData();
   const p = pd.photos.find(x => x.id === pid);
   if (!p) return;
-  zlOpenPhotoViewer(p.data);
+  zlOpenPhotoViewer(p.data, { kind: 'zl', pid });
 }
-function zlOpenPhotoViewer(src) {
+let zlPvCtx = null;
+let zlPvScale = 1, zlPvTx = 0, zlPvTy = 0;
+let zlPvPointers = new Map();
+let zlPvPinch = null;
+let zlPvDrag = null;
+
+function zlApplyPv() {
+  const img = document.getElementById('zlPhotoViewerImg');
+  if (img) img.style.transform = 'translate(' + zlPvTx + 'px,' + zlPvTy + 'px) scale(' + zlPvScale + ')';
+  const z = document.getElementById('zlPvZoom');
+  if (z) z.textContent = Math.round(zlPvScale * 100) + '%';
+}
+function zlPvClamp() {
+  const stage = document.getElementById('zlPvStage');
+  const img = document.getElementById('zlPhotoViewerImg');
+  if (!stage || !img) return;
+  const r = img.getBoundingClientRect();
+  const sr = stage.getBoundingClientRect();
+  const maxX = Math.max(0, (r.width * zlPvScale - sr.width) / 2 + 40);
+  const maxY = Math.max(0, (r.height * zlPvScale - sr.height) / 2 + 40);
+  if (zlPvTx > maxX) zlPvTx = maxX; if (zlPvTx < -maxX) zlPvTx = -maxX;
+  if (zlPvTy > maxY) zlPvTy = maxY; if (zlPvTy < -maxY) zlPvTy = -maxY;
+}
+function zlPvSetScale(s, cx, cy) {
+  s = Math.min(6, Math.max(1, s));
+  const stage = document.getElementById('zlPvStage');
+  if (stage && cx != null) {
+    const sr = stage.getBoundingClientRect();
+    const ox = (cx - (sr.left + sr.width / 2));
+    const oy = (cy - (sr.top + sr.height / 2));
+    zlPvTx = ox - (ox - zlPvTx) * (s / zlPvScale);
+    zlPvTy = oy - (oy - zlPvTy) * (s / zlPvScale);
+  }
+  zlPvScale = s;
+  if (s <= 1.001) { zlPvTx = 0; zlPvTy = 0; }
+  zlPvClamp();
+  zlApplyPv();
+}
+function zlOpenPhotoViewer(src, ctx) {
+  zlPvCtx = ctx || null;
+  zlPvScale = 1; zlPvTx = 0; zlPvTy = 0;
   const v = document.getElementById('zlPhotoViewer');
   document.getElementById('zlPhotoViewerImg').src = src;
+  zlApplyPv();
   v.classList.add('show');
   if (window.AppBridge && AppBridge.setPhotoViewerOpen) AppBridge.setPhotoViewerOpen(true);
 }
@@ -1642,12 +1718,82 @@ function zlClosePhotoViewer() {
   const v = document.getElementById('zlPhotoViewer');
   v.classList.remove('show');
   document.getElementById('zlPhotoViewerImg').src = '';
+  zlPvScale = 1; zlPvTx = 0; zlPvTy = 0;
   if (window.AppBridge && AppBridge.setPhotoViewerOpen) AppBridge.setPhotoViewerOpen(false);
 }
 function zlPhotoViewerOpen() { return document.getElementById('zlPhotoViewer').classList.contains('show'); }
+function zlEditCurrentPhoto() {
+  if (!zlPvCtx) { alert('该图片暂不支持标注'); return; }
+  const src = document.getElementById('zlPhotoViewerImg').src;
+  PhotoEditor.open(src, function (edited) {
+    zlSavePhotoDataById(zlPvCtx, edited);
+    document.getElementById('zlPhotoViewerImg').src = edited;
+    zlPvScale = 1; zlPvTx = 0; zlPvTy = 0; zlApplyPv();
+  });
+}
+function zlSavePhotoDataById(ctx, data) {
+  if (!ctx) return;
+  if (ctx.kind === 'zl') {
+    const pd = zlGetPhotoData(); const p = pd.photos.find(x => x.id === ctx.pid);
+    if (p) { p.data = data; zlSavePhotoData(pd); if (window.renderZiliao) renderZiliao(); }
+  } else if (ctx.kind === 'module') {
+    const slot = window.__cardPhoto && window.__cardPhoto[ctx.key];
+    if (slot) { const pd = slot.get(); const p = pd.photos.find(x => x.id === ctx.pid); if (p) { p.data = data; slot.save(pd); slot.render(); } }
+  } else if (ctx.kind === 'shishi') {
+    const pd = shishiPhotoData(); const p = pd.photos.find(x => x.id === ctx.pid);
+    if (p) { p.data = data; shishiSavePhoto(pd); if (window.renderShishi) renderShishi(); }
+  }
+}
 (function () {
   const v = document.getElementById('zlPhotoViewer');
-  v.addEventListener('click', function (e) { if (e.target === v || e.target.id === 'zlPhotoViewerImg') zlClosePhotoViewer(); });
+  v.addEventListener('click', function (e) { if (e.target === v && zlPvScale <= 1.001) zlClosePhotoViewer(); });
+  const stage = document.getElementById('zlPvStage');
+  const bar = v.querySelector('.zl-pv-bar');
+  bar.addEventListener('click', function (e) {
+    const b = e.target.closest('button'); if (!b) return;
+    const z = b.dataset.z;
+    if (z === 'in') zlPvSetScale(zlPvScale * 1.4);
+    else if (z === 'out') zlPvSetScale(zlPvScale / 1.4);
+    else if (z === 'reset') zlPvSetScale(1);
+  });
+  document.getElementById('zlPvEditBtn').addEventListener('click', zlEditCurrentPhoto);
+  stage.addEventListener('pointerdown', function (e) {
+    stage.setPointerCapture(e.pointerId);
+    zlPvPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (zlPvPointers.size === 1 && zlPvScale > 1.001) {
+      zlPvDrag = { x: e.clientX, y: e.clientY, tx: zlPvTx, ty: zlPvTy };
+    } else if (zlPvPointers.size === 2) {
+      const pts = [...zlPvPointers.values()];
+      zlPvPinch = { d: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y), s: zlPvScale };
+      zlPvDrag = null;
+    }
+  });
+  stage.addEventListener('pointermove', function (e) {
+    if (!zlPvPointers.has(e.pointerId)) return;
+    zlPvPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (zlPvPinch && zlPvPointers.size === 2) {
+      const pts = [...zlPvPointers.values()];
+      const d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      const sr = stage.getBoundingClientRect();
+      zlPvSetScale(zlPvPinch.s * d / zlPvPinch.d, sr.left + sr.width / 2, sr.top + sr.height / 2);
+    } else if (zlPvDrag) {
+      zlPvTx = zlPvDrag.tx + (e.clientX - zlPvDrag.x);
+      zlPvTy = zlPvDrag.ty + (e.clientY - zlPvDrag.y);
+      zlPvClamp(); zlApplyPv();
+    }
+  });
+  function up(e) {
+    zlPvPointers.delete(e.pointerId);
+    if (zlPvPointers.size < 2) zlPvPinch = null;
+    if (zlPvPointers.size === 0) zlPvDrag = null;
+  }
+  stage.addEventListener('pointerup', up);
+  stage.addEventListener('pointercancel', up);
+  stage.addEventListener('dblclick', function (e) {
+    e.preventDefault();
+    if (zlPvScale > 1.001) zlPvSetScale(1);
+    else zlPvSetScale(2.5, e.clientX, e.clientY);
+  });
 })();
 
 function toggleMobileSidebar() {
@@ -1929,7 +2075,7 @@ function buildCardModule(prefix, cfg) {
     const pd = getPhotoData(key);
     const p = pd.photos.find(x => x.id === pid);
     if (!p) return;
-    zlOpenPhotoViewer(p.data);
+    zlOpenPhotoViewer(p.data, { kind: 'module', key, pid });
   };
   window[FN.setGroup] = function (key, gid) {
     const pd = getPhotoData(key);
@@ -2156,7 +2302,7 @@ window.shishiPhoto = function (input) {
 window.shishiDelPhoto = function (gid, pid) { const pd = shishiPhotoData(); pd.photos = pd.photos.filter(p => p.id !== pid); shishiSavePhoto(pd); renderShishi(); };
 window.shishiZoom = function (pid) {
   const pd = shishiPhotoData(); const p = pd.photos.find(x => x.id === pid);
-  if (!p) return; zlOpenPhotoViewer(p.data);
+  if (!p) return; zlOpenPhotoViewer(p.data, { kind: 'shishi', pid });
 };
 window.shishiSetGroup = function (gid) { const pd = shishiPhotoData(); if (pd.groups.some(g => g.id === gid)) { pd.active = gid; shishiSavePhoto(pd); renderShishi(); } };
 window.shishiAddGroup = function () { const name = prompt('输入新分组名称：'); if (!name) return; const pd = shishiPhotoData(); const id = 'g' + Date.now(); pd.groups.push({ id, name }); pd.active = id; shishiSavePhoto(pd); renderShishi(); };
@@ -2367,7 +2513,9 @@ const PhotoEditor = (function () {
       + '.photo-editor .pe-actions{display:flex;gap:10px;padding:10px 12px;border-top:1px solid #f1f1f1;align-self:stretch;justify-content:flex-end;}'
       + '.photo-editor .pe-actions button{border-radius:9px;padding:9px 18px;font-size:14px;cursor:pointer;border:none;}'
       + '.photo-editor .pe-cancel{background:#fff;color:#666;border:1px solid #ddd !important;}'
-      + '.photo-editor .pe-save{background:#E0301E;color:#fff;font-weight:700;}';
+      + '.photo-editor .pe-save{background:#E0301E;color:#fff;font-weight:700;}'
+      + '.photo-editor .pe-texts{position:absolute;inset:0;pointer-events:none;}'
+      + '.photo-editor .pe-text{position:absolute;pointer-events:auto;transform:translate(-50%,-50%);color:#fff;font-weight:800;font-family:sans-serif;white-space:nowrap;cursor:move;touch-action:none;-webkit-text-stroke:1px #000;text-shadow:0 0 3px #000;}';
     document.head.appendChild(st);
 
     mask = document.createElement('div');
@@ -2377,7 +2525,7 @@ const PhotoEditor = (function () {
       + '<div class="pe-header">📷 编辑错题照片（旋转 / 翻转 / 裁剪 / 调亮后保存）</div>'
       + '<div class="pe-stage" id="pe-stage"><img id="pe-img" alt=""><div class="pe-crop" id="pe-crop">'
       + '<span class="pe-handle nw" data-h="nw"></span><span class="pe-handle ne" data-h="ne"></span>'
-      + '<span class="pe-handle sw" data-h="sw"></span><span class="pe-handle se" data-h="se"></span></div></div>'
+      + '<span class="pe-handle sw" data-h="sw"></span><span class="pe-handle se" data-h="se"></span></div><div class="pe-texts" id="pe-texts"></div></div>'
       + '<div class="pe-tools">'
       + '<button type="button" data-act="rotL">↺ 左转</button>'
       + '<button type="button" data-act="rotR">↻ 右转</button>'
@@ -2385,6 +2533,7 @@ const PhotoEditor = (function () {
       + '<button type="button" data-act="flipV">⇅ 垂直翻转</button>'
       + '<button type="button" data-act="bri+">☀ 变亮</button>'
       + '<button type="button" data-act="bri-">🌙 变暗</button>'
+      + '<button type="button" data-act="text">✎ 文字</button>'
       + '<button type="button" data-act="crop">✂ 裁剪</button>'
       + '<button type="button" data-act="reset">↺ 重置</button>'
       + '</div>'
@@ -2459,7 +2608,8 @@ const PhotoEditor = (function () {
     else if (a === 'flipV') { state.flipV = !state.flipV; cropAfterTransform(); }
     else if (a === 'bri+') state.bri = Math.min(200, state.bri + 15);
     else if (a === 'bri-') state.bri = Math.max(40, state.bri - 15);
-    else if (a === 'reset') { state = { rot: 0, flipH: false, flipV: false, bri: 100, con: 100 }; cropMode = false; cropEl.style.display = 'none'; }
+    else if (a === 'text') { const t = prompt('输入要写在图片上的文字：'); if (t != null && t.trim() !== '') addText(t.trim()); }
+    else if (a === 'reset') { state = { rot: 0, flipH: false, flipV: false, bri: 100, con: 100, texts: [] }; cropMode = false; cropEl.style.display = 'none'; renderTexts(); }
     else if (a === 'crop') {
       cropMode = !cropMode;
       cropEl.style.display = cropMode ? 'block' : 'none';
@@ -2501,6 +2651,38 @@ const PhotoEditor = (function () {
     cropEl.style.width = width + 'px'; cropEl.style.height = height + 'px';
   }
   function onCropUp() { drag = null; }
+  function renderTexts() {
+    const layer = document.getElementById('pe-texts'); if (!layer) return;
+    layer.innerHTML = '';
+    (state.texts || []).forEach(function (it, i) {
+      const d = document.createElement('div');
+      d.className = 'pe-text';
+      d.style.left = it.x + 'px'; d.style.top = it.y + 'px'; d.style.fontSize = it.size + 'px';
+      d.textContent = it.text;
+      d.addEventListener('pointerdown', function (e) {
+        e.preventDefault(); e.stopPropagation();
+        const sx = e.clientX, sy = e.clientY, ox = it.x, oy = it.y;
+        function mv(ev) { it.x = ox + (ev.clientX - sx); it.y = oy + (ev.clientY - sy); d.style.left = it.x + 'px'; d.style.top = it.y + 'px'; }
+        function uph() { window.removeEventListener('pointermove', mv); window.removeEventListener('pointerup', uph); }
+        window.addEventListener('pointermove', mv); window.addEventListener('pointerup', uph);
+      });
+      d.addEventListener('dblclick', function (e) {
+        e.preventDefault(); e.stopPropagation();
+        const nt = prompt('修改文字（留空则删除）', it.text);
+        if (nt == null) return;
+        if (nt.trim() === '') { state.texts.splice(i, 1); renderTexts(); }
+        else { it.text = nt; d.textContent = nt; }
+      });
+      layer.appendChild(d);
+    });
+  }
+  function addText(t) {
+    const x = stage.clientWidth / 2, y = stage.clientHeight / 2;
+    const size = Math.max(18, Math.round(stage.clientWidth * 0.07));
+    state.texts = state.texts || [];
+    state.texts.push({ x: x, y: y, text: t, size: size });
+    renderTexts();
+  }
 
   function save() {
     const sx = work.width / stage.clientWidth;
@@ -2513,7 +2695,25 @@ const PhotoEditor = (function () {
     const maxW = 1400; let ow = cw, oh = ch;
     if (ow > maxW) { oh = Math.round(oh * maxW / ow); ow = maxW; }
     const out = document.createElement('canvas'); out.width = ow; out.height = oh;
-    out.getContext('2d').drawImage(work, cx, cy, cw, ch, 0, 0, ow, oh);
+    const octx = out.getContext('2d');
+    octx.drawImage(work, cx, cy, cw, ch, 0, 0, ow, oh);
+    if (state.texts && state.texts.length) {
+      const sx2 = work.width / stage.clientWidth;
+      const scaleOut = ow / cw;
+      octx.save();
+      octx.beginPath(); octx.rect(0, 0, ow, oh); octx.clip();
+      octx.textAlign = 'center'; octx.textBaseline = 'middle';
+      state.texts.forEach(function (it) {
+        const ox = (it.x * sx2 - cx) * scaleOut;
+        const oy = (it.y * sx2 - cy) * scaleOut;
+        const fs = it.size * sx2 * scaleOut;
+        octx.font = '800 ' + fs + 'px sans-serif';
+        octx.lineWidth = Math.max(1, fs / 10);
+        octx.strokeStyle = '#000'; octx.fillStyle = '#fff';
+        octx.strokeText(it.text, ox, oy); octx.fillText(it.text, ox, oy);
+      });
+      octx.restore();
+    }
     const data = out.toDataURL('image/jpeg', 0.85);
     const cb = onSave; close(); if (cb) cb(data);
   }
@@ -2532,7 +2732,8 @@ const PhotoEditor = (function () {
       const im2 = new Image();
       im2.onload = () => {
         img = im2; onSave = cb;
-        state = { rot: 0, flipH: false, flipV: false, bri: 100, con: 100 };
+        state = { rot: 0, flipH: false, flipV: false, bri: 100, con: 100, texts: [] };
+        renderTexts();
         cropMode = false; cropEl.style.display = 'none';
         rebuild();
         mask.style.display = 'flex';

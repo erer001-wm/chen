@@ -921,7 +921,58 @@ const PhotoStore = (function () {
     if (db) { try { db.transaction(OS, 'readwrite').objectStore(OS).delete(key); } catch (e) {} return; }
     LS.remove(key);
   }
-  return { whenReady, get, set, remove };
+  async function allEntries() {
+    const out = {};
+    if (db) {
+      await new Promise((resolve) => {
+        try {
+          const tx = db.transaction(OS, 'readonly');
+          const r = tx.objectStore(OS).getAllKeys();
+          r.onsuccess = () => {
+            const keys = r.result || [];
+            if (!keys.length) return resolve();
+            let pending = keys.length;
+            keys.forEach((k) => {
+              const g = tx.objectStore(OS).get(k);
+              g.onsuccess = () => { out[k] = g.result; if (--pending === 0) resolve(); };
+              g.onerror = () => { if (--pending === 0) resolve(); };
+            });
+          };
+          r.onerror = () => resolve();
+        } catch (e) { resolve(); }
+      });
+    } else {
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const full = localStorage.key(i);
+          if (!full || full.indexOf(LS.prefix) !== 0) continue;
+          const k = full.slice(LS.prefix.length);
+          if (isPhotoKey(k)) out[k] = localStorage.getItem(full);
+        }
+      } catch (e) {}
+    }
+    return out;
+  }
+  async function loadEntries(obj) {
+    const keys = Object.keys(obj || {});
+    if (!keys.length) return;
+    keys.forEach((k) => { try { cache[k] = JSON.parse(obj[k]); } catch (e) { cache[k] = obj[k]; } });
+    if (db) {
+      await new Promise((resolve) => {
+        try {
+          const tx = db.transaction(OS, 'readwrite');
+          const os = tx.objectStore(OS);
+          keys.forEach((k) => { try { os.put(obj[k], k); } catch (e) {} });
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => resolve();
+          tx.onabort = () => resolve();
+        } catch (e) { resolve(); }
+      });
+    } else {
+      keys.forEach((k) => { try { localStorage.setItem(LS.prefix + k, obj[k]); } catch (e) {} });
+    }
+  }
+  return { whenReady, get, set, remove, allEntries, loadEntries, isPhotoKey };
 })();
 
 /* 保存前压缩照片：最长边 maxDim、JPEG quality，显著减小体积（配合 IndexedDB 可存更多） */
@@ -2916,7 +2967,7 @@ const CloudSync = (function () {
   function isEmptyRepo(err) {
     return err && (err.status === 409 || err.status === 404 || (err.message && err.message.indexOf('empty') >= 0));
   }
-  function collectLocal() {
+  async function collectLocal() {
     const data = {};
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
@@ -2924,6 +2975,11 @@ const CloudSync = (function () {
         data[k.slice(store.prefix.length)] = localStorage.getItem(k); // 原始字符串，无损
       }
     }
+    // 合并 IndexedDB 中的错题本照片（PhotoStore 存的是 JSON 字符串，无损）
+    try {
+      const photos = await PhotoStore.allEntries();
+      for (const k in photos) if (!(k in data)) data[k] = photos[k];
+    } catch (e) {}
     return { app: 'gwy_workbench', version: 1, exportedAt: new Date().toISOString(), data };
   }
   // ===== Gitee 上传：用 contents 接口 + 本地计算 blob SHA（绕过 Gitee SHA bug）=====
@@ -3013,7 +3069,12 @@ const CloudSync = (function () {
     const d = payload.data || {};
     window.__autoSyncSuppress = true;
     try {
-      for (const k in d) localStorage.setItem(store.prefix + k, d[k]);
+      const photoEntries = {};
+      for (const k in d) {
+        if (PhotoStore.isPhotoKey(k)) photoEntries[k] = d[k];
+        else localStorage.setItem(store.prefix + k, d[k]);
+      }
+      if (Object.keys(photoEntries).length) await PhotoStore.loadEntries(photoEntries);
     } finally {
       window.__autoSyncSuppress = false;
     }
@@ -3027,7 +3088,7 @@ const CloudSync = (function () {
     if (!cfg.token || !cfg.repo) throw new Error('请先在①填写 Token 和仓库');
     const prov = PROVIDERS[cfg.provider] || PROVIDERS.github;
     log('读取本地数据...');
-    const payload = collectLocal();
+    const payload = await collectLocal();
     const content = b64encode(JSON.stringify(payload));
     const base = '/repos/' + cfg.repo;
     if (cfg.provider === 'gitee') {
@@ -3119,7 +3180,12 @@ const CloudSync = (function () {
     const d = payload.data || {};
     window.__autoSyncSuppress = true;
     try {
-      for (const k in d) localStorage.setItem(store.prefix + k, d[k]);
+      const photoEntries = {};
+      for (const k in d) {
+        if (PhotoStore.isPhotoKey(k)) photoEntries[k] = d[k];
+        else localStorage.setItem(store.prefix + k, d[k]);
+      }
+      if (Object.keys(photoEntries).length) await PhotoStore.loadEntries(photoEntries);
     } finally {
       window.__autoSyncSuppress = false;
     }
@@ -3128,7 +3194,7 @@ const CloudSync = (function () {
     const cur = store.get('current_page', 'home');
     if (cur !== 'cloud' && pageRenderers[cur]) pageRenderers[cur]();
   }
-  return { getCfg, setCfg, upload, download, validate, PROVIDERS };
+  return { getCfg, setCfg, upload, download, validate, PROVIDERS, collectLocal };
 })();
 
 function renderCloud() {
@@ -3278,7 +3344,7 @@ document.getElementById('page-cloud').addEventListener('click', async (e) => {
       const lt = page.querySelector('#cloud-last'); if (lt) lt.textContent = new Date().toLocaleString('zh-CN');
     } else if (act === 'cloud-export') {
       try {
-        const payload = CloudSync.collectLocal();
+        const payload = await CloudSync.collectLocal();
         const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
         const a = document.createElement('a');
         const d = new Date().toISOString().slice(0, 10);
@@ -3303,7 +3369,12 @@ document.getElementById('page-cloud').addEventListener('click', async (e) => {
           const d = (payload && payload.data) || payload;
           window.__autoSyncSuppress = true;
           try {
-            for (const k in d) localStorage.setItem(store.prefix + k, d[k]);
+            const photoEntries = {};
+            for (const k in d) {
+              if (PhotoStore.isPhotoKey(k)) photoEntries[k] = d[k];
+              else localStorage.setItem(store.prefix + k, d[k]);
+            }
+            if (Object.keys(photoEntries).length) await PhotoStore.loadEntries(photoEntries);
           } finally { window.__autoSyncSuppress = false; }
           store.set('cloud_last_sync', new Date().toISOString());
           log('✅ 已导入备份，' + Object.keys(d).length + ' 条数据已写入本机');

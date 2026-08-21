@@ -819,6 +819,130 @@ const store = {
 };
 
 /* ================================================================
+   错题本大图存储：迁移到 IndexedDB（配额大，通常数百 MB）
+   - 内存做同步缓存，读写保持同步 API，避免改动全站渲染逻辑
+   - 启动时空 localStorage 中的旧照片自动迁移进 IndexedDB 并清出 localStorage（释放 5MB 配额）
+   - 设备不支持 IndexedDB 时自动回退 localStorage（旧行为）
+   ================================================================ */
+const PhotoStore = (function () {
+  const DB_NAME = 'beikao_photo_db';
+  const OS = 'photo';
+  const LS = store;                       // 复用前缀与 localStorage 读写
+  const cache = Object.create(null);     // 同步缓存：照片键 -> 解析后的对象
+  let db = null, ready = false, prom = null;
+
+  function isPhotoKey(k) { return /_wrong_photos($|_)/.test(k); }
+
+  function openDB() {
+    return new Promise((resolve) => {
+      if (typeof indexedDB === 'undefined') { ready = true; resolve(); return; }
+      let req;
+      try { req = indexedDB.open(DB_NAME, 1); }
+      catch (e) { ready = true; resolve(); return; }
+      req.onupgradeneeded = (e) => {
+        const d = e.target.result;
+        if (!d.objectStoreNames.contains(OS)) d.createObjectStore(OS);
+      };
+      req.onsuccess = (e) => { db = e.target.result; migrateLocal().then(() => { ready = true; resolve(); }); };
+      req.onerror = () => { ready = true; resolve(); };
+    });
+  }
+
+  // 把 localStorage 里残留的照片键（含老版本共享键）迁移进 IndexedDB，再清出 localStorage
+  function migrateLocal() {
+    return new Promise((resolve) => {
+      if (!db) return resolve();
+      const toMove = [];
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const full = localStorage.key(i);
+          if (!full || full.indexOf(LS.prefix) !== 0) continue;
+          const k = full.slice(LS.prefix.length);
+          if (!isPhotoKey(k)) continue;
+          try { toMove.push([k, JSON.parse(localStorage.getItem(full))]); } catch (e) {}
+        }
+      } catch (e) {}
+      if (!toMove.length) return resolve();
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      try {
+        const tx = db.transaction(OS, 'readwrite');
+        const os = tx.objectStore(OS);
+        toMove.forEach(([k, v]) => { cache[k] = v; try { os.put(JSON.stringify(v), k); } catch (e) {} });
+        tx.oncomplete = () => {
+          toMove.forEach(([k]) => { try { localStorage.removeItem(LS.prefix + k); } catch (e) {} });
+          finish();
+        };
+        tx.onerror = finish; tx.onabort = finish;
+      } catch (e) { finish(); }
+      setTimeout(finish, 5000);
+    });
+  }
+
+  function loadAll() {
+    return new Promise((resolve) => {
+      if (!db) return resolve();
+      const tx = db.transaction(OS, 'readonly');
+      const r = tx.objectStore(OS).getAllKeys();
+      r.onsuccess = () => {
+        const keys = r.result || [];
+        if (!keys.length) return resolve();
+        let pending = keys.length;
+        keys.forEach((k) => {
+          const g = tx.objectStore(OS).get(k);
+          g.onsuccess = () => { try { cache[k] = JSON.parse(g.result); } catch (e) {} if (--pending === 0) resolve(); };
+          g.onerror = () => { if (--pending === 0) resolve(); };
+        });
+      };
+      r.onerror = () => resolve();
+    });
+  }
+
+  function whenReady() {
+    if (prom) return prom;
+    prom = openDB().then(loadAll);
+    return prom;
+  }
+  function get(key, def) {
+    if (key in cache) return cache[key];
+    if (db) return def;              // 已加载完，缓存未命中即无此键
+    return LS.get(key, def);         // 回退：直接读 localStorage
+  }
+  function set(key, val) {
+    cache[key] = val;
+    if (db) {
+      try { const tx = db.transaction(OS, 'readwrite'); tx.objectStore(OS).put(JSON.stringify(val), key); } catch (e) {}
+      return val;
+    }
+    return LS.set(key, val);          // 回退
+  }
+  function remove(key) {
+    delete cache[key];
+    if (db) { try { db.transaction(OS, 'readwrite').objectStore(OS).delete(key); } catch (e) {} return; }
+    LS.remove(key);
+  }
+  return { whenReady, get, set, remove };
+})();
+
+/* 保存前压缩照片：最长边 maxDim、JPEG quality，显著减小体积（配合 IndexedDB 可存更多） */
+function compressPhoto(dataUrl, maxDim, quality) {
+  return new Promise((resolve) => {
+    maxDim = maxDim || 1200; quality = quality || 0.6;
+    if (!dataUrl || dataUrl.indexOf('data:image') !== 0) { resolve(dataUrl); return; }
+    const img = new Image();
+    img.onload = () => {
+      let w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+      if (w > maxDim || h > maxDim) { const s = maxDim / Math.max(w, h); w = Math.round(w * s); h = Math.round(h * s); }
+      const c = document.createElement('canvas'); c.width = w; c.height = h;
+      c.getContext('2d').drawImage(img, 0, 0, w, h);
+      try { resolve(c.toDataURL('image/jpeg', quality)); } catch (e) { resolve(dataUrl); }
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
+/* ================================================================
    页面注册表 —— 12个页面（后续逐页填充 render 内容）
    ================================================================ */
 const PAGES = [
@@ -1554,7 +1678,7 @@ function zlBackToGrid() { zlSub = null; renderZiliao(); }
 
 /* 错题本：拍照并压缩存储（控制体积，避免 localStorage 超限），按分组管理 */
 function zlGetPhotoData() {
-  let d = store.get('zl_wrong_photos', null);
+  let d = PhotoStore.get('zl_wrong_photos', null);
   if (d === null) {
     d = { groups: [{ id: 'g0', name: '默认分组' }], photos: [], active: 'g0' };
   } else if (Array.isArray(d)) {
@@ -1567,7 +1691,7 @@ function zlGetPhotoData() {
   }
   return d;
 }
-function zlSavePhotoData(d) { store.set('zl_wrong_photos', d); }
+function zlSavePhotoData(d) { PhotoStore.set('zl_wrong_photos', d); }
 function zlHandlePhoto(input) {
   const file = input.files && input.files[0];
   if (!file) return;
@@ -1577,10 +1701,12 @@ function zlHandlePhoto(input) {
     img.onload = () => {
       // 先打开照片编辑器，编辑完成后再写入错题本
       PhotoEditor.open(reader.result, (edited) => {
-        const pd = zlGetPhotoData();
-        pd.photos.push({ id: 'p' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), data: edited, group: pd.active });
-        zlSavePhotoData(pd);
-        renderZiliao();   // 重渲染错题本详情，显示新照片
+        compressPhoto(edited).then((c) => {
+          const pd = zlGetPhotoData();
+          pd.photos.push({ id: 'p' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), data: c, group: pd.active });
+          zlSavePhotoData(pd);
+          renderZiliao();   // 重渲染错题本详情，显示新照片
+        });
       });
       input.value = '';
     };
@@ -1676,12 +1802,14 @@ function zlEditCurrentPhoto() {
   if (!zlPvCtx) { alert('该图片暂不支持标注'); return; }
   const src = document.getElementById('zlPhotoViewerImg').src;
   PhotoEditor.open(src, function (edited) {
-    zlSavePhotoDataById(zlPvCtx, edited);
-    const img = document.getElementById('zlPhotoViewerImg');
-    img.onload = function () { zlPvComputeFit(); zlPvClamp(); zlApplyPv(); };
-    img.src = edited;
-    if (img.complete) { zlPvComputeFit(); zlPvClamp(); zlApplyPv(); }
-    zlPvScale = 1; zlPvTx = 0; zlPvTy = 0;
+    compressPhoto(edited).then(function (c) {
+      zlSavePhotoDataById(zlPvCtx, c);
+      const img = document.getElementById('zlPhotoViewerImg');
+      img.onload = function () { zlPvComputeFit(); zlPvClamp(); zlApplyPv(); };
+      img.src = c;
+      if (img.complete) { zlPvComputeFit(); zlPvClamp(); zlApplyPv(); }
+      zlPvScale = 1; zlPvTx = 0; zlPvTy = 0;
+    });
   });
 }
 function zlSavePhotoDataById(ctx, data) {
@@ -1837,17 +1965,17 @@ function buildCardModule(prefix, cfg) {
   const photoKey = k => prefix + '_wrong_photos_' + k;
   /* 老版本共享照片键迁移到「错题本(wrong)」卡片，仅执行一次 */
   function migratePhotos() {
-    if (store.get(prefix + '_wrong_photos', null) !== null) {
-      const legacy = store.get(prefix + '_wrong_photos', []);
-      if (legacy.length && store.get(photoKey('wrong'), []).length === 0) {
-        store.set(photoKey('wrong'), legacy);
+    if (PhotoStore.get(prefix + '_wrong_photos', null) !== null) {
+      const legacy = PhotoStore.get(prefix + '_wrong_photos', []);
+      if (legacy.length && PhotoStore.get(photoKey('wrong'), []).length === 0) {
+        PhotoStore.set(photoKey('wrong'), legacy);
       }
-      store.remove(prefix + '_wrong_photos');
+      PhotoStore.remove(prefix + '_wrong_photos');
     }
   }
   /* 错题照片数据（按分组）：{groups:[{id,name}], photos:[{id,data,group}], active} */
   function getPhotoData(key) {
-    let d = store.get(photoKey(key), null);
+    let d = PhotoStore.get(photoKey(key), null);
     if (d === null) {
       d = { groups: [{ id: 'g0', name: '默认分组' }], photos: [], active: 'g0' };
     } else if (Array.isArray(d)) {
@@ -1860,7 +1988,7 @@ function buildCardModule(prefix, cfg) {
     }
     return d;
   }
-  function savePhotoData(key, d) { store.set(photoKey(key), d); }
+  function savePhotoData(key, d) { PhotoStore.set(photoKey(key), d); }
 
   function notesInit() {
     if (store.get(prefix + '_notes', null) === null) {
@@ -2227,12 +2355,12 @@ window.shishiDoUpdate = function () {
   alert(n > 0 ? ('已更新，新增 ' + n + ' 条时政') : '已是最新，无新增');
 };
 function shishiPhotoData() {
-  let d = store.get(SHISHI_PHOTO_KEY, null);
+  let d = PhotoStore.get(SHISHI_PHOTO_KEY, null);
   if (d === null) { d = { groups: [{ id: 'g0', name: '默认分组' }], photos: [], active: 'g0' }; }
   else if (Array.isArray(d)) { d = { groups: [{ id: 'g0', name: '默认分组' }], photos: d.map((u, i) => ({ id: 'p' + Date.now() + '_' + i, data: u, group: 'g0' })), active: 'g0' }; }
   return d;
 }
-function shishiSavePhoto(d) { store.set(SHISHI_PHOTO_KEY, d); }
+function shishiSavePhoto(d) { PhotoStore.set(SHISHI_PHOTO_KEY, d); }
 window.shishiPhoto = function (input) {
   const file = input.files && input.files[0]; if (!file) return;
   const reader = new FileReader();
@@ -2384,26 +2512,28 @@ function takePhotoBridge(target, renderFn) {
 function onNativePhoto(dataUrl) {
   if (!_pendingPhoto || !dataUrl) { _pendingPhoto = null; _photoRender = null; return; }
   PhotoEditor.open(dataUrl, (edited) => {
-    if (_pendingPhoto.kind === 'ziliao') {
-      const pd = zlGetPhotoData();
-      pd.photos.push({ id: 'p' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), data: edited, group: pd.active });
-      zlSavePhotoData(pd);
-      renderZiliao();
-    } else if (_pendingPhoto.kind === 'shishi') {
-      const pd = shishiPhotoData();
-      pd.photos.push({ id: 'p' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), data: edited, group: pd.active });
-      shishiSavePhoto(pd);
-      renderShishi();
-    } else {
-      const k = _pendingPhoto.key;
-      const st = (window.__cardPhoto && window.__cardPhoto[k]) || null;
-      if (!st) { _pendingPhoto = null; _photoRender = null; alert('该模块暂不支持拍照,请重试'); return; }
-      const pd = st.get();
-      pd.photos.push({ id: 'p' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), data: edited, group: pd.active });
-      st.save(pd);
-      st.render();
-    }
-    _pendingPhoto = null; _photoRender = null;
+    compressPhoto(edited).then((c) => {
+      if (_pendingPhoto.kind === 'ziliao') {
+        const pd = zlGetPhotoData();
+        pd.photos.push({ id: 'p' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), data: c, group: pd.active });
+        zlSavePhotoData(pd);
+        renderZiliao();
+      } else if (_pendingPhoto.kind === 'shishi') {
+        const pd = shishiPhotoData();
+        pd.photos.push({ id: 'p' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), data: c, group: pd.active });
+        shishiSavePhoto(pd);
+        renderShishi();
+      } else {
+        const k = _pendingPhoto.key;
+        const st = (window.__cardPhoto && window.__cardPhoto[k]) || null;
+        if (!st) { _pendingPhoto = null; _photoRender = null; alert('该模块暂不支持拍照,请重试'); return; }
+        const pd = st.get();
+        pd.photos.push({ id: 'p' + Date.now() + '_' + Math.random().toString(36).slice(2, 7), data: c, group: pd.active });
+        st.save(pd);
+        st.render();
+      }
+      _pendingPhoto = null; _photoRender = null;
+    });
   });
 }
 
@@ -3204,8 +3334,10 @@ document.getElementById('page-cloud').addEventListener('change', (e) => {
   if (cfg.autoSync) doAutoUpload();
 });
 
-/* 初始化：恢复上次页面，默认首页总览 */
-switchPage(store.get('current_page', 'home'));
+/* 初始化：等照片存储(IndexedDB)就绪后再渲染，避免照片未加载即显示 */
+PhotoStore.whenReady().then(function () {
+  switchPage(store.get('current_page', 'home'));
+});
 
 /* 窗口大小变化时重绘首页图表，保证手机/平板切换时自适应 */
 let __resizeTimer;

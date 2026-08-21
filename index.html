@@ -2904,6 +2904,9 @@ const PhotoEditor = (function () {
 const CloudSync = (function () {
   const CFG_KEY = 'cloud_cfg';
   const BACKUP_PATH = 'beikao/backup.json';
+  const BACKUP_META = 'beikao/backup.meta.json';   // 分片备份的清单
+  const BACKUP_PART = 'beikao/backup.part';        // 分片文件，后接序号
+  const GITEE_CHUNK = 900 * 1024;                 // Gitee 单文件 1MB 限制，分片留安全余量
   const PROVIDERS = {
     github: { name: 'GitHub', api: 'https://api.github.com', auth: 'header', hub: 'github.com' },
     gitee:  { name: 'Gitee',  api: 'https://gitee.com/api/v5', auth: 'query',  hub: 'gitee.com' }
@@ -3014,38 +3017,32 @@ const CloudSync = (function () {
     } catch (e) {}
     return ex.sha;
   }
-  async function uploadGitee(cfg, base, content, log) {
-    const filePath = BACKUP_PATH;
+  // 把单个文件 PUT/POST 到 Gitee contents（自动处理已存在/不存在 + 本地校正 SHA，绕过 Gitee SHA bug）
+  async function giteePutSingle(base, branch, filePath, content, log) {
     const getUrl = base + '/contents/' + filePath;
     let existingSha = null;
     try {
-      const ex = await request('GET', getUrl + '?ref=' + encodeURIComponent(cfg.branch));
+      const ex = await request('GET', getUrl + '?ref=' + encodeURIComponent(branch));
       existingSha = await correctShaFromContent(ex, log);
-      log('检测到云端已有备份，准备更新...');
     } catch (e) {
       if (e && e.status !== 404) throw e; // 404=文件尚不存在，可创建
-      log('云端无此备份，准备新建...');
     }
-    log('提交到云端（约 ' + Math.round(content.length / 1024) + ' KB）...');
     const body = {
       content: content,
       message: 'beikao backup ' + new Date().toISOString(),
-      branch: cfg.branch
+      branch: branch
     };
     if (existingSha) {
-      // 文件已存在：Gitee 要求 PUT + sha
       body.sha = existingSha;
       await request('PUT', getUrl, body);
     } else {
-      // 文件不存在：Gitee 要求 POST（无需 sha）
       try {
         await request('POST', getUrl, body);
       } catch (err) {
         const msg = ((err && err.message) || '').toLowerCase();
-        // 若因并发/网络导致 GET 误判为不存在，POST 时提示已存在，则自动改为更新
         if (err.status === 400 || err.status === 422 || msg.indexOf('文件名已存在') >= 0 || msg.indexOf('already exists') >= 0 || msg.indexOf('exists') >= 0) {
           log('检测到文件实际已存在，改用更新模式...');
-          const ex2 = await request('GET', getUrl + '?ref=' + encodeURIComponent(cfg.branch));
+          const ex2 = await request('GET', getUrl + '?ref=' + encodeURIComponent(branch));
           body.sha = await correctShaFromContent(ex2, log);
           await request('PUT', getUrl, body);
         } else {
@@ -3053,35 +3050,172 @@ const CloudSync = (function () {
         }
       }
     }
+  }
+  async function uploadGitee(cfg, base, content, log) {
+    if (content.length <= GITEE_CHUNK) {
+      // 未超 1MB：维持原单文件逻辑，兼容旧备份
+      log('提交到云端（约 ' + Math.round(content.length / 1024) + ' KB）...');
+      await giteePutSingle(base, cfg.branch, BACKUP_PATH, content, log);
+      store.set('cloud_last_sync', new Date().toISOString());
+      log('✅ 上传完成');
+      return;
+    }
+    // 超过 Gitee 单文件 1MB 限制：分片上传，每片 < 1MB，绕过限制（带照片的备份必走这里）
+    log('备份约 ' + Math.round(content.length / 1024) + ' KB，超过 Gitee 1MB 限制，自动分片上传（避免照片丢失）...');
+    const parts = [];
+    for (let i = 0; i < content.length; i += GITEE_CHUNK) parts.push(content.slice(i, i + GITEE_CHUNK));
+    const meta = b64encode(JSON.stringify({ split: true, parts: parts.length, app: 'gwy_workbench', version: 1, exportedAt: new Date().toISOString() }));
+    await giteePutSingle(base, cfg.branch, BACKUP_META, meta, log);
+    for (let i = 0; i < parts.length; i++) {
+      log('上传分片 ' + (i + 1) + '/' + parts.length + '...');
+      await giteePutSingle(base, cfg.branch, BACKUP_PART + i, parts[i], log);
+    }
+    // 清掉可能残留的旧单文件备份，避免下载时混用
+    try {
+      const ex = await request('GET', base + '/contents/' + BACKUP_PATH + '?ref=' + encodeURIComponent(cfg.branch));
+      const sha = await correctShaFromContent(ex, log);
+      if (sha) await request('DELETE', base + '/contents/' + BACKUP_PATH + '?ref=' + encodeURIComponent(cfg.branch), { message: 'cleanup split', sha: sha, branch: cfg.branch });
+    } catch (e) {}
     store.set('cloud_last_sync', new Date().toISOString());
-    log('✅ 上传完成');
+    log('✅ 上传完成（分 ' + parts.length + ' 片，已避开 Gitee 1MB 限制，照片已完整备份）');
+  }
+  // 容错识别：某条云端数据是否为"错题照片集合"（不仅看键名，也看内容结构）
+  function looksLikePhotos(val) {
+    if (typeof val !== 'string') return false;
+    let arr; try { arr = JSON.parse(val); } catch (e) { return false; }
+    if (!arr || typeof arr !== 'object') return false;
+    const items = Array.isArray(arr) ? arr : (Array.isArray(arr.photos) ? arr.photos : null);
+    if (!items) return false;
+    if (items.length === 0) return true;
+    const s = items[0];
+    const d = (s && typeof s === 'object' && typeof s.data === 'string') ? s.data : (typeof s === 'string' ? s : null);
+    return typeof d === 'string' && d.indexOf('data:image') === 0;
+  }
+  function countPhotosOf(val) {
+    let arr; try { arr = JSON.parse(val); } catch (e) { arr = val; }
+    const items = (arr && Array.isArray(arr.photos)) ? arr.photos : (Array.isArray(arr) ? arr : []);
+    return items.length;
+  }
+  // 兼容老版本备份：根可能直接是数据地图（无 data 包裹），也可能带 wb_ 前缀
+  function extractData(payload) {
+    if (payload && payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)) return payload.data;
+    if (payload && typeof payload === 'object' && !Array.isArray(payload) && !('app' in payload) && Object.keys(payload).length) return payload;
+    return {};
+  }
+  function stripPrefix(k) {
+    return (typeof k === 'string' && k.indexOf(store.prefix) === 0) ? k.slice(store.prefix.length) : k;
+  }
+  // 统一的云端数据恢复：识别照片→写 PhotoStore；其余→localStorage；强制刷新所有视图；明确反馈张数
+  async function restoreFromCloudData(d, log) {
+    d = (d && typeof d === 'object') ? d : {};
+    const photoEntries = {};
+    let nonPhoto = 0;
+    for (const raw in d) {
+      const k = stripPrefix(raw);            // 兼容老备份可能带 wb_ 前缀，避免“写进去读不到”
+      const val = d[raw];
+      if (PhotoStore.isPhotoKey(k) || looksLikePhotos(val)) {
+        photoEntries[k] = val;
+      } else {
+        try { localStorage.setItem(store.prefix + k, val); nonPhoto++; } catch (e) {}
+      }
+    }
+    let photoTotal = 0;
+    Object.keys(photoEntries).forEach(k => { photoTotal += countPhotosOf(photoEntries[k]); });
+    if (Object.keys(photoEntries).length) await PhotoStore.loadEntries(photoEntries);
+    // 强制刷新所有已注册页面，让错题本立即显示恢复的照片
+    try { Object.keys(pageRenderers).forEach(p => { try { pageRenderers[p](); } catch (e) {} }); } catch (e) {}
+    if (!Object.keys(photoEntries).length) {
+      log('⚠️ 云端备份中未找到任何错题照片（其它数据 ' + nonPhoto + ' 条已写入）。');
+      log('   可能原因：① 当初上传时备份损坏/被覆盖；② 备份格式与当前版本不兼容。');
+      log('   可靠做法：在原设备用「③ 导出备份文件 → 新设备导入备份文件」，不经过云端、不限大小。');
+    } else {
+      log('✅ 已从云端恢复 ' + photoTotal + ' 张错题照片（' + Object.keys(photoEntries).length + ' 个相册），其余 ' + nonPhoto + ' 条数据已写入本机。');
+    }
+    return { photoTotal, photoKeys: Object.keys(photoEntries).length, nonPhoto };
+  }
+  async function diagnose(log) {
+    const cfg = getCfg();
+    if (!cfg.token || !cfg.repo) throw new Error('请先在①填写 Token 和仓库');
+    const prov = PROVIDERS[cfg.provider] || PROVIDERS.github;
+    const base = '/repos/' + cfg.repo;
+    log('🔍 诊断云端备份...');
+    let payload;
+    if (cfg.provider === 'gitee') {
+      let content = null;
+      try {
+        const metaRes = await request('GET', base + '/contents/' + BACKUP_META + '?ref=' + encodeURIComponent(cfg.branch));
+        const meta = JSON.parse(b64decode(metaRes.content));
+        if (meta && meta.split) {
+          let full = '';
+          for (let i = 0; i < meta.parts; i++) {
+            const pr = await request('GET', base + '/contents/' + BACKUP_PART + i + '?ref=' + encodeURIComponent(cfg.branch));
+            full += b64decode(pr.content);
+          }
+          content = full;
+        }
+      } catch (e) {}
+      if (!content) {
+        const ex = await request('GET', base + '/contents/' + BACKUP_PATH + '?ref=' + encodeURIComponent(cfg.branch));
+        content = b64decode(ex.content);
+      }
+      payload = JSON.parse(content);
+    } else {
+      const branchSha = await getBranchSha(base, cfg.branch);
+      const commit = await request('GET', base + '/git/commits/' + branchSha);
+      const tree = await request('GET', base + '/git/trees/' + commit.tree.sha + '?recursive=1');
+      const entry = (tree.tree || []).find(t => t.path === BACKUP_PATH);
+      if (!entry) { log('⚠️ 云端还没有备份文件 beikao/backup.json，请先在原设备「上传」'); return; }
+      const blob = await request('GET', base + '/git/blobs/' + entry.sha);
+      payload = JSON.parse(b64decode(blob.content));
+    }
+    const d = extractData(payload);
+    const keys = Object.keys(d);
+    let photoKeys = 0, photoTotal = 0;
+    const samples = [];
+    keys.forEach(k => {
+      if (PhotoStore.isPhotoKey(k) || looksLikePhotos(d[k])) {
+        photoKeys++; photoTotal += countPhotosOf(d[k]);
+        if (samples.length < 10) samples.push(k);
+      }
+    });
+    log('📦 云端备份约 ' + Math.round(JSON.stringify(payload).length / 1024) + ' KB，共 ' + keys.length + ' 条数据。');
+    if (photoKeys === 0) {
+      log('🖼️ 云端备份里没有任何错题照片 —— 问题出在「上传」那一步（照片没传上去），不是下载。请改用「③ 导出备份文件 → 导入」。');
+    } else {
+      log('🖼️ 云端备份含 ' + photoKeys + ' 个相册、约 ' + photoTotal + ' 张错题照片。键名示例：' + samples.join('、'));
+      log('   现在点「从云端下载」即可恢复这些照片。');
+    }
   }
   async function downloadGitee(cfg, base, log) {
-    const getUrl = base + '/contents/' + BACKUP_PATH;
-    let res;
+    const branch = cfg.branch;
+    // 先尝试分片备份（meta + partN），没有再退回单文件备份
+    let content = null;
     try {
-      res = await request('GET', getUrl + '?ref=' + encodeURIComponent(cfg.branch));
-    } catch (e) {
-      if (e && e.status === 404) { log('云端还没有备份，请先在原设备「上传」'); return; }
-      throw e;
-    }
-    const payload = JSON.parse(b64decode(res.content));
-    const d = payload.data || {};
-    window.__autoSyncSuppress = true;
-    try {
-      const photoEntries = {};
-      for (const k in d) {
-        if (PhotoStore.isPhotoKey(k)) photoEntries[k] = d[k];
-        else localStorage.setItem(store.prefix + k, d[k]);
+      const metaRes = await request('GET', base + '/contents/' + BACKUP_META + '?ref=' + encodeURIComponent(branch));
+      const meta = JSON.parse(b64decode(metaRes.content));
+      if (meta && meta.split) {
+        log('检测到分片备份（' + meta.parts + ' 片），开始合并...');
+        let full = '';
+        for (let i = 0; i < meta.parts; i++) {
+          const pr = await request('GET', base + '/contents/' + BACKUP_PART + i + '?ref=' + encodeURIComponent(branch));
+          full += b64decode(pr.content);
+        }
+        content = full;
       }
-      if (Object.keys(photoEntries).length) await PhotoStore.loadEntries(photoEntries);
-    } finally {
-      window.__autoSyncSuppress = false;
+    } catch (e) {}
+    if (!content) {
+      try {
+        const res = await request('GET', base + '/contents/' + BACKUP_PATH + '?ref=' + encodeURIComponent(branch));
+        content = b64decode(res.content);
+      } catch (e) {
+        if (e && e.status === 404) { log('云端还没有备份，请先在原设备「上传」'); return; }
+        throw e;
+      }
     }
+    const payload = JSON.parse(content);
+    const d = extractData(payload);
     store.set('cloud_last_sync', new Date().toISOString());
-    log('✅ 下载完成，已写入本机');
-    const cur = store.get('current_page', 'home');
-    if (cur !== 'cloud' && pageRenderers[cur]) pageRenderers[cur]();
+    await restoreFromCloudData(d, log);
   }
   async function upload(log) {
     const cfg = getCfg();
@@ -3090,6 +3224,9 @@ const CloudSync = (function () {
     log('读取本地数据...');
     const payload = await collectLocal();
     const content = b64encode(JSON.stringify(payload));
+    if (cfg.provider === 'gitee' && content.length > 1024 * 1024) {
+      log('ℹ️ 备份约 ' + Math.round(content.length / 1024) + ' KB，超过 Gitee 单文件 1MB 限制，将自动分片上传（照片不会丢）。');
+    }
     const base = '/repos/' + cfg.repo;
     if (cfg.provider === 'gitee') {
       await uploadGitee(cfg, base, content, log);
@@ -3177,24 +3314,11 @@ const CloudSync = (function () {
     if (!entry) { log('云端还没有备份，请先在原设备「上传」'); return; }
     const blob = await request('GET', base + '/git/blobs/' + entry.sha);
     const payload = JSON.parse(b64decode(blob.content));
-    const d = payload.data || {};
-    window.__autoSyncSuppress = true;
-    try {
-      const photoEntries = {};
-      for (const k in d) {
-        if (PhotoStore.isPhotoKey(k)) photoEntries[k] = d[k];
-        else localStorage.setItem(store.prefix + k, d[k]);
-      }
-      if (Object.keys(photoEntries).length) await PhotoStore.loadEntries(photoEntries);
-    } finally {
-      window.__autoSyncSuppress = false;
-    }
+    const d = extractData(payload);
     store.set('cloud_last_sync', new Date().toISOString());
-    log('✅ 下载完成，已写入本机');
-    const cur = store.get('current_page', 'home');
-    if (cur !== 'cloud' && pageRenderers[cur]) pageRenderers[cur]();
+    await restoreFromCloudData(d, log);
   }
-  return { getCfg, setCfg, upload, download, validate, PROVIDERS, collectLocal };
+  return { getCfg, setCfg, upload, download, validate, PROVIDERS, collectLocal, diagnose, extractData };
 })();
 
 function renderCloud() {
@@ -3233,6 +3357,7 @@ function renderCloud() {
         <div class="cloud-btns">
           <button data-act="cloud-upload">⬆ 上传到云端（备份本机）</button>
           <button data-act="cloud-download">⬇ 从云端下载（恢复本机）</button>
+          <button data-act="cloud-diagnose">🔍 诊断云端备份</button>
         </div>
         <p class="cloud-tip">下载会用云端数据覆盖本机。换设备前，请先在原设备点「上传」。</p>
         <div id="cloud-log" class="cloud-log"></div>
@@ -3342,6 +3467,11 @@ document.getElementById('page-cloud').addEventListener('click', async (e) => {
       actEl.disabled = true; log('开始下载...');
       await CloudSync.download(log);
       const lt = page.querySelector('#cloud-last'); if (lt) lt.textContent = new Date().toLocaleString('zh-CN');
+    } else if (act === 'cloud-diagnose') {
+      actEl.disabled = true; log('开始诊断...');
+      try { await CloudSync.diagnose(log); }
+      catch (err) { log('❌ 诊断失败：' + (err.message || err)); }
+      finally { actEl.disabled = false; }
     } else if (act === 'cloud-export') {
       try {
         const payload = await CloudSync.collectLocal();
@@ -3366,20 +3496,9 @@ document.getElementById('page-cloud').addEventListener('click', async (e) => {
         try {
           const text = await f.text();
           const payload = JSON.parse(text);
-          const d = (payload && payload.data) || payload;
-          window.__autoSyncSuppress = true;
-          try {
-            const photoEntries = {};
-            for (const k in d) {
-              if (PhotoStore.isPhotoKey(k)) photoEntries[k] = d[k];
-              else localStorage.setItem(store.prefix + k, d[k]);
-            }
-            if (Object.keys(photoEntries).length) await PhotoStore.loadEntries(photoEntries);
-          } finally { window.__autoSyncSuppress = false; }
+          const d = CloudSync.extractData(payload);
           store.set('cloud_last_sync', new Date().toISOString());
-          log('✅ 已导入备份，' + Object.keys(d).length + ' 条数据已写入本机');
-          const cur = store.get('current_page', 'home');
-          if (cur !== 'cloud' && pageRenderers[cur]) pageRenderers[cur]();
+          await restoreFromCloudData(d, log);
         } catch (err) {
           log('❌ 导入失败：' + (err.message || err));
         }
